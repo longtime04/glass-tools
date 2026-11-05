@@ -96,6 +96,8 @@ private struct ScannerView: UIViewControllerRepresentable {
 
 private final class ScannerViewController: UIViewController {
     private let session = AVCaptureSession()
+    private let sessionQueue = DispatchQueue(label: "com.long.glasstools.camera", qos: .userInitiated)
+    private var sessionConfigured = false
     private var previewLayer: AVCaptureVideoPreviewLayer?
     private let onFound: (String) -> Void
     private let onDenied: () -> Void
@@ -112,8 +114,17 @@ private final class ScannerViewController: UIViewController {
         fatalError("init(coder:) 不可用")
     }
 
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
+
     override func viewDidLoad() {
         super.viewDidLoad()
+        // 来电、锁屏等打断相机后，系统恢复时把会话重新跑起来。
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(sessionInterruptionEnded),
+            name: .AVCaptureSessionInterruptionEnded, object: session
+        )
         switch AVCaptureDevice.authorizationStatus(for: .video) {
         case .authorized:
             setupSession()
@@ -129,6 +140,33 @@ private final class ScannerViewController: UIViewController {
             }
         default:
             onDenied()
+        }
+    }
+
+    // 切到别的标签再回来、扫完一张再回来，相机都要重新跑起来；
+    // 之前只在 viewWillDisappear 里停，没在回来时启动，画面就定在上一帧不动了。
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        restartSessionIfNeeded()
+    }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        restartSessionIfNeeded()
+        if let layer = previewLayer {
+            layer.frame = view.bounds
+        }
+    }
+
+    @objc private func sessionInterruptionEnded() {
+        restartSessionIfNeeded()
+    }
+
+    private func restartSessionIfNeeded() {
+        guard sessionConfigured, !session.isRunning else { return }
+        metadataDelegate.reset()
+        sessionQueue.async { [weak self] in
+            self?.session.startRunning()
         }
     }
 
@@ -151,7 +189,11 @@ private final class ScannerViewController: UIViewController {
         layer.frame = view.bounds
         view.layer.addSublayer(layer)
         previewLayer = layer
-        session.startRunning()
+        sessionConfigured = true
+        // startRunning 会堵主线程，放后台队列跑，切换标签不卡。
+        sessionQueue.async { [weak self] in
+            self?.session.startRunning()
+        }
     }
 
     override func viewDidLayoutSubviews() {
@@ -161,13 +203,15 @@ private final class ScannerViewController: UIViewController {
 
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
-        if session.isRunning {
+        sessionQueue.async { [weak self] in
+            guard let session = self?.session, session.isRunning else { return }
             session.stopRunning()
         }
     }
 
     @MainActor private func handleFound(_ code: String) {
-        if session.isRunning {
+        sessionQueue.async { [weak self] in
+            guard let session = self?.session, session.isRunning else { return }
             session.stopRunning()
         }
         onFound(code)
@@ -179,6 +223,11 @@ private final class ScannerViewController: UIViewController {
 private final class MetadataDelegate: NSObject, AVCaptureMetadataOutputObjectsDelegate {
     var onFound: ((String) -> Void)?
     private var didFind = false
+
+    /// 回到扫码页时清掉“已扫到”标记，不然回来后扫不到第二张。
+    func reset() {
+        didFind = false
+    }
 
     func metadataOutput(
         _ output: AVCaptureMetadataOutput,
