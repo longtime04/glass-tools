@@ -94,14 +94,14 @@ private struct ScannerView: UIViewControllerRepresentable {
     func updateUIViewController(_ uiViewController: ScannerViewController, context: Context) {}
 }
 
-private final class ScannerViewController: UIViewController, AVCaptureMetadataOutputObjectsDelegate {
+private final class ScannerViewController: UIViewController {
     private let session = AVCaptureSession()
     private var previewLayer: AVCaptureVideoPreviewLayer?
     private let onFound: (String) -> Void
     private let onDenied: () -> Void
-    private var didFind = false
+    private let metadataDelegate = MetadataDelegate()
 
-    init(onFound: @escaping (String) -> Void, onDenied: @escaping (String) -> Void) {
+    init(onFound: @escaping (String) -> Void, onDenied: @escaping () -> Void) {
         self.onFound = onFound
         self.onDenied = onDenied
         super.init(nibName: nil, bundle: nil)
@@ -141,7 +141,10 @@ private final class ScannerViewController: UIViewController, AVCaptureMetadataOu
         let output = AVCaptureMetadataOutput()
         guard session.canAddOutput(output) else { return }
         session.addOutput(output)
-        output.setMetadataObjectsDelegate(self, queue: .main)
+        metadataDelegate.onFound = { [weak self] code in
+            Task { @MainActor in self?.handleFound(code) }
+        }
+        output.setMetadataObjectsDelegate(metadataDelegate, queue: .main)
         output.metadataObjectTypes = [.qr, .ean13, .ean8, .code128, .code39, .upce]
         let layer = AVCaptureVideoPreviewLayer(session: session)
         layer.videoGravity = .resizeAspectFill
@@ -163,6 +166,20 @@ private final class ScannerViewController: UIViewController, AVCaptureMetadataOu
         }
     }
 
+    @MainActor private func handleFound(_ code: String) {
+        if session.isRunning {
+            session.stopRunning()
+        }
+        onFound(code)
+    }
+}
+
+/// 元数据输出回调：单独的 NSObject，不带 @MainActor，避免 Swift 6 并发检查报错。
+/// 回调本身跑在 .main 队列（setMetadataObjectsDelegate 时指定），只做找码和转发。
+private final class MetadataDelegate: NSObject, AVCaptureMetadataOutputObjectsDelegate {
+    var onFound: ((String) -> Void)?
+    private var didFind = false
+
     func metadataOutput(
         _ output: AVCaptureMetadataOutput,
         didOutput metadataObjects: [AVMetadataObject],
@@ -173,7 +190,6 @@ private final class ScannerViewController: UIViewController, AVCaptureMetadataOu
               let code = obj.stringValue
         else { return }
         didFind = true
-        session.stopRunning()
-        onFound(code)
+        onFound?(code)
     }
 }
